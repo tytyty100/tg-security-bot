@@ -1,0 +1,5 @@
+bot.log
+settings.json
+__pycache__
+*.pyc
+.git
