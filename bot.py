@@ -619,15 +619,23 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mention = make_mention(user)
     if diff <= BAN_MARGIN:
+        until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES)
         try:
-            await chat.ban_member(user.id)
+            await chat.restrict_member(user.id, permissions=MUTE_PERMS, until_date=until)
         except Exception:
             return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Пропустить", callback_data=f"skip_raider:{user.id}")],
+            [InlineKeyboardButton("Забанить", callback_data=f"ban_raider:{user.id}")],
+        ])
         try:
             await context.bot.send_message(
                 chat.id,
-                f"{mention} забанен: вероятно рейдер (аккаунт создан совсем недавно).",
+                f"⚠️ Внимание, подозрение на рейдера! {mention} "
+                f"(аккаунт создан совсем недавно).\n"
+                f"Пользователь замучен на {dur_text(MUTE_MINUTES)}.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=kb,
             )
         except Exception:
             pass
@@ -640,6 +648,50 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+
+async def skip_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer("Только администраторы могут это делать!", show_alert=True)
+        return
+
+    target_id = int(query.data.split(":")[1])
+    try:
+        await chat.restrict_member(target_id, permissions=UNMUTE_PERMS)
+    except Exception:
+        await query.answer("Не удалось пропустить. Проверьте, что бот администратор.", show_alert=True)
+        return
+
+    try:
+        await query.message.edit_text("Пользователь пропущен (размучен).", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await query.answer("Готово")
+
+
+async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer("Только администраторы могут это делать!", show_alert=True)
+        return
+
+    target_id = int(query.data.split(":")[1])
+    try:
+        await chat.ban_member(target_id)
+    except Exception:
+        await query.answer("Не удалось забанить. Проверьте, что бот администратор.", show_alert=True)
+        return
+
+    try:
+        await query.message.edit_text("Пользователь забанен.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await query.answer("Готово")
 
 
 async def banword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -801,6 +853,8 @@ def main():
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
     app.add_handler(CallbackQueryHandler(account_check_cb, pattern=r"^account_check$"))
+    app.add_handler(CallbackQueryHandler(skip_raider_cb, pattern=r"^skip_raider:\d+$"))
+    app.add_handler(CallbackQueryHandler(ban_raider_cb, pattern=r"^ban_raider:\d+$"))
     app.add_handler(ChatMemberHandler(on_new_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
