@@ -321,15 +321,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         mat_count = len(MAT_PATTERN.findall(txt))
-        words = chat_config[chat.id]["words"]
-        if words:
-            mat_count += len(
-                re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE).findall(txt)
-            )
         if mat_count >= mat_n:
             await mute_user(update, user, "мат", delete_ids=[msg.message_id])
             clear_tracks(chat.id, user.id)
             return
+
+        words = chat_config[chat.id]["words"]
+        if words:
+            word_count = len(
+                re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE).findall(txt)
+            )
+            if word_count > 0:
+                await mute_user(update, user, "бан-слово", delete_ids=[msg.message_id])
+                clear_tracks(chat.id, user.id)
+                return
 
         mention_count = 0
         pings_admin = False
