@@ -194,8 +194,6 @@ async def delete_message(chat, message_id: int):
 
 async def mute_user(update: Update, user, reason: str, minutes: int = MUTE_MINUTES, delete_ids=()) -> bool:
     chat = update.effective_chat
-    for mid in delete_ids:
-        await delete_message(chat, mid)
     until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     try:
         await chat.restrict_member(user.id, permissions=MUTE_PERMS, until_date=until)
@@ -203,7 +201,7 @@ async def mute_user(update: Update, user, reason: str, minutes: int = MUTE_MINUT
         return False
     mention = make_mention(user)
     text = (
-        f"{mention} замучен за {reason} на {dur_text(minutes)}.\n"
+        f"Пользователь {mention} замучен за {reason} на {dur_text(minutes)}.\n"
         f"Размутить могут только администраторы."
     )
     keyboard = InlineKeyboardMarkup(
@@ -215,6 +213,8 @@ async def mute_user(update: Update, user, reason: str, minutes: int = MUTE_MINUT
         )
     except Exception:
         pass
+    for mid in delete_ids:
+        await delete_message(chat, mid)
     return True
 
 
@@ -328,11 +328,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         words = chat_config[chat.id]["words"]
         if words:
-            word_count = len(
-                re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE).findall(txt)
-            )
-            if word_count > 0:
-                await mute_user(update, user, "бан-слово", delete_ids=[msg.message_id])
+            matched = [w for w in words if re.search(re.escape(w), txt, re.IGNORECASE)]
+            if matched:
+                await mute_user(
+                    update, user, f"бан-слово «{matched[0]}»",
+                    delete_ids=[msg.message_id],
+                )
                 clear_tracks(chat.id, user.id)
                 return
 
