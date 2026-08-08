@@ -69,7 +69,7 @@ MAT_PATTERN = re.compile(
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "words": []}
+    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": []}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -113,6 +113,7 @@ def load_settings():
                 cfg = _new_chat_config()
                 cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
                 cfg["words"] = [str(w).lower() for w in value.get("words", [])]
+                cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
                 chat_config[cid] = cfg
     except Exception:
         pass
@@ -345,14 +346,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mention_entities:
             admins = await chat.get_administrators()
             admin_ids = {m.user.id for m in admins}
-            admin_names = {m.user.username.lower() for m in admins if m.user.username}
+            admin_names = {m.user.username.lower(): m.user.id for m in admins if m.user.username}
+            whitelist = set(chat_config[chat.id]["ping_whitelist"])
             for e in mention_entities:
                 if e.type == "text_mention" and e.user and e.user.id in admin_ids:
-                    pings_admin = True
+                    if e.user.id not in whitelist:
+                        pings_admin = True
                     mention_count += 1
                 elif e.type == "mention":
                     mention_count += 1
-                    if msg.text[e.offset + 1:e.offset + e.length].lower() in admin_names:
+                    uname = msg.text[e.offset + 1:e.offset + e.length].lower()
+                    if uname in admin_names and admin_names[uname] not in whitelist:
                         pings_admin = True
 
         if pings_admin:
@@ -597,6 +601,46 @@ async def words_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("Бан-слова:\n" + "\n".join(f"- {w}" for w in words))
 
 
+async def stopbanuserme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /stopbanuserme работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут использовать эту команду.")
+        return
+
+    whitelist = chat_config[chat.id]["ping_whitelist"]
+    if user.id not in whitelist:
+        whitelist.append(user.id)
+        save_settings()
+    await msg.reply_text("теперь вы в белом списке для пинга (вас можно пинговать)")
+
+
+async def gobanuserme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /gobanuserme работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут использовать эту команду.")
+        return
+
+    whitelist = chat_config[chat.id]["ping_whitelist"]
+    if user.id in whitelist:
+        whitelist.remove(user.id)
+        save_settings()
+    await msg.reply_text("вы убраны из белого списка для пинга (вас снова нельзя пинговать)")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if update.effective_chat.type != "private":
@@ -641,6 +685,8 @@ def main():
     app.add_handler(CommandHandler("banword", banword_cmd))
     app.add_handler(CommandHandler("unbanword", unbanword_cmd))
     app.add_handler(CommandHandler("words", words_cmd))
+    app.add_handler(CommandHandler("stopbanuserme", stopbanuserme_cmd))
+    app.add_handler(CommandHandler("gobanuserme", gobanuserme_cmd))
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
