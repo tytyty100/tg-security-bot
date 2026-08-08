@@ -1,4 +1,6 @@
 bot.log
+bot_err.log
 settings.json
+token.txt
 __pycache__/
 *.pyc
