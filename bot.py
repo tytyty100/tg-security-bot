@@ -197,7 +197,6 @@ def settings_text(level: str) -> str:
 
 
 def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
-    check = chat_config[chat_id]["account_check"]
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"Низкая {'✓' if level == 'низкая' else ''}",
@@ -210,11 +209,6 @@ def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             f"Высокая {'✓' if level == 'высокая' else ''}",
             callback_data="harshness:высокая",
-        ),
-    ], [
-        InlineKeyboardButton(
-            f"Проверка аккаунтов: {'✓ вкл' if check else 'выкл'}",
-            callback_data="account_check",
         ),
     ]])
 
@@ -842,8 +836,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- спам ссылками и массовыми упоминаниями\n"
         "- пингование администраторов\n"
         "- мат (включая ваши бан-слова)\n"
-        "- флуд медиа и спам пересылками\n"
-        "- проверка аккаунтов новых участников (в /settings)\n\n"
+        "- флуд медиа и спам пересылками\n\n"
         "Команды для администраторов:\n"
         "/settings - настройка жёсткости (низкая/средняя/высокая)\n"
         "/banword <слово> - добавить бан-слово\n"
@@ -881,17 +874,13 @@ def main():
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
-    app.add_handler(CallbackQueryHandler(account_check_cb, pattern=r"^account_check$"))
-    app.add_handler(CallbackQueryHandler(skip_raider_cb, pattern=r"^skip_raider:\d+$"))
-    app.add_handler(CallbackQueryHandler(ban_raider_cb, pattern=r"^ban_raider:\d+$"))
-    app.add_handler(ChatMemberHandler(on_new_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
