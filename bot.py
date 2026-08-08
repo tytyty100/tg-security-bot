@@ -19,7 +19,6 @@ def _ipv4_only_getaddrinfo(*args, **kwargs):
 socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from telegram import (
-    ChatMember,
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -29,6 +28,7 @@ from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -44,9 +44,12 @@ MUTE_MINUTES = 180  # 3 часа
 
 DEFAULT_LEVEL = "низкая"
 LEVELS = {
-    "низкая": {"flood": (7, 4), "spam": (7, 5), "links": 4, "mats": 15},
-    "средняя": {"flood": (4, 4), "spam": (5, 5), "links": 3, "mats": 8},
-    "высокая": {"flood": (3, 4), "spam": (3, 5), "links": 2, "mats": 3},
+    "низкая": {"flood": (7, 4), "spam": (7, 5), "links": 4, "mats": 15,
+               "media": (5, 10), "fwd": (5, 10), "mentions": 5, "caps": (20, 80)},
+    "средняя": {"flood": (4, 4), "spam": (5, 5), "links": 3, "mats": 8,
+                "media": (4, 10), "fwd": (4, 10), "mentions": 3, "caps": (15, 80)},
+    "высокая": {"flood": (3, 4), "spam": (3, 5), "links": 2, "mats": 3,
+                "media": (3, 10), "fwd": (3, 10), "mentions": 2, "caps": (10, 80)},
 }
 
 MAT_ROOTS = (
@@ -65,9 +68,16 @@ MAT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-chat_level = defaultdict(lambda: DEFAULT_LEVEL)
+
+def _new_chat_config():
+    return {"level": DEFAULT_LEVEL, "captcha": True, "verified": [], "words": []}
+
+
+chat_config = defaultdict(_new_chat_config)
 history = defaultdict(lambda: defaultdict(deque))       # chat -> user -> deque[(time, message_id)]
 text_history = defaultdict(lambda: defaultdict(deque))  # chat -> user -> deque[(text, time, message_id)]
+media_history = defaultdict(lambda: defaultdict(deque))      # chat -> user -> deque[(time, message_id)]
+forward_history = defaultdict(lambda: defaultdict(deque))    # chat -> user -> deque[(time, message_id)]
 
 MUTE_PERMS = ChatPermissions(can_send_messages=False)
 UNMUTE_PERMS = ChatPermissions(
@@ -91,14 +101,22 @@ ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
 def load_settings():
-    global chat_level
-    chat_level = defaultdict(lambda: DEFAULT_LEVEL)
+    global chat_config
+    chat_config = defaultdict(_new_chat_config)
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         for key, value in data.items():
-            if value in LEVELS:
-                chat_level[int(key)] = value
+            cid = int(key)
+            if isinstance(value, str):
+                chat_config[cid]["level"] = value if value in LEVELS else DEFAULT_LEVEL
+            elif isinstance(value, dict):
+                cfg = _new_chat_config()
+                cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
+                cfg["captcha"] = bool(value.get("captcha", True))
+                cfg["verified"] = [int(u) for u in value.get("verified", [])]
+                cfg["words"] = [str(w).lower() for w in value.get("words", [])]
+                chat_config[cid] = cfg
     except Exception:
         pass
 
@@ -106,25 +124,41 @@ def load_settings():
 def save_settings():
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(dict(chat_level), f, ensure_ascii=False, indent=2)
+            json.dump({str(k): v for k, v in chat_config.items()}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
+def is_verified(chat_id: int, user_id: int) -> bool:
+    return user_id in chat_config[chat_id]["verified"]
+
+
+def add_verified(chat_id: int, user_id: int):
+    if user_id not in chat_config[chat_id]["verified"]:
+        chat_config[chat_id]["verified"].append(user_id)
+        save_settings()
+
+
 def get_level(chat_id: int) -> str:
-    return chat_level.get(chat_id, DEFAULT_LEVEL)
+    return chat_config[chat_id]["level"]
 
 
 def level_desc(level: str) -> str:
     cfg = LEVELS[level]
     f_n, f_w = cfg["flood"]
     s_n, s_w = cfg["spam"]
+    m_n, m_w = cfg["media"]
+    fv_n, fv_w = cfg["fwd"]
     return (
         f"{level}:\n"
         f"- флуд: {f_n}+ сообщений за {f_w} сек\n"
         f"- спам: {s_n} одинаковых за {s_w} сек\n"
         f"- спам ссылками: {cfg['links']}+ ссылок\n"
         f"- мат: {cfg['mats']}+ в одном сообщении\n"
+        f"- флуд медиа: {m_n}+ за {m_w} сек\n"
+        f"- спам пересылками: {fv_n}+ за {fv_w} сек\n"
+        f"- массовые упоминания: {cfg['mentions']}+\n"
+        f"- КАПС: от {cfg['caps'][0]} символов при {cfg['caps'][1]}% заглавных\n"
     )
 
 
@@ -198,6 +232,13 @@ async def mute_user(update: Update, user, reason: str, minutes: int = MUTE_MINUT
     return True
 
 
+def clear_tracks(chat_id: int, user_id: int):
+    history[chat_id][user_id].clear()
+    text_history[chat_id][user_id].clear()
+    media_history[chat_id][user_id].clear()
+    forward_history[chat_id][user_id].clear()
+
+
 async def unmute_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat = query.message.chat
@@ -246,6 +287,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spam_n, spam_w = cfg["spam"]
     link_n = cfg["links"]
     mat_n = cfg["mats"]
+    media_n, media_w = cfg["media"]
+    fwd_n, fwd_w = cfg["fwd"]
+    mention_n = cfg["mentions"]
+    caps_min, caps_pct = cfg["caps"]
 
     now = time.time()
     ch = history[chat.id][user.id]
@@ -255,25 +300,66 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(ch) >= flood_n:
         await mute_user(update, user, "флуд", delete_ids=[mid for _, mid in ch])
-        ch.clear()
-        text_history[chat.id][user.id].clear()
+        clear_tracks(chat.id, user.id)
         return
+
+    is_media = bool(
+        msg.photo or msg.video or msg.audio or msg.document or msg.voice
+        or msg.video_note or msg.sticker or msg.animation
+    )
+    if is_media:
+        mh = media_history[chat.id][user.id]
+        mh.append((now, msg.message_id))
+        while mh and mh[0][0] < now - media_w:
+            mh.popleft()
+        if len(mh) >= media_n:
+            await mute_user(update, user, "флуд медиа", delete_ids=[mid for _, mid in mh])
+            clear_tracks(chat.id, user.id)
+            return
+
+    if msg.forward_origin:
+        fh = forward_history[chat.id][user.id]
+        fh.append((now, msg.message_id))
+        while fh and fh[0][0] < now - fwd_w:
+            fh.popleft()
+        if len(fh) >= fwd_n:
+            await mute_user(update, user, "спам пересылками", delete_ids=[mid for _, mid in fh])
+            clear_tracks(chat.id, user.id)
+            return
 
     txt = msg.text or msg.caption or ""
     if txt:
         link_count = txt.count("http://") + txt.count("https://") + txt.count("t.me/")
         if link_count >= link_n:
             await mute_user(update, user, "спам ссылками", delete_ids=[msg.message_id])
-            ch.clear()
-            text_history[chat.id][user.id].clear()
+            clear_tracks(chat.id, user.id)
             return
 
         mat_count = len(MAT_PATTERN.findall(txt))
+        words = chat_config[chat.id]["words"]
+        if words:
+            mat_count += len(
+                re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE).findall(txt)
+            )
         if mat_count >= mat_n:
             await mute_user(update, user, "мат", delete_ids=[msg.message_id])
-            ch.clear()
-            text_history[chat.id][user.id].clear()
+            clear_tracks(chat.id, user.id)
             return
+
+        mention_count = sum(
+            1 for e in (msg.entities or []) if e.type in ("mention", "text_mention")
+        )
+        if mention_count >= mention_n:
+            await mute_user(update, user, "массовые упоминания", delete_ids=[msg.message_id])
+            clear_tracks(chat.id, user.id)
+            return
+
+        if len(txt) >= caps_min:
+            letters = [c for c in txt if c.isalpha()]
+            if letters and 100 * sum(1 for c in letters if c.isupper()) / len(letters) >= caps_pct:
+                await mute_user(update, user, "КАПС", delete_ids=[msg.message_id])
+                clear_tracks(chat.id, user.id)
+                return
 
         th = text_history[chat.id][user.id]
         th.append((txt, now, msg.message_id))
@@ -282,8 +368,69 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(th) >= spam_n and len({t for t, _, _ in th}) == 1:
             await mute_user(update, user, "спам", delete_ids=[mid for _, _, mid in th])
-            ch.clear()
-            th.clear()
+            clear_tracks(chat.id, user.id)
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not is_group(chat):
+        return
+
+    change = update.chat_member
+    new = change.new_chat_member
+    if new.status != ChatMemberStatus.MEMBER:
+        return
+
+    user = new.user
+    if user.is_bot:
+        return
+    if not chat_config[chat.id]["captcha"]:
+        return
+    if is_verified(chat.id, user.id):
+        return
+
+    try:
+        await chat.restrict_member(user.id, permissions=MUTE_PERMS)
+    except Exception:
+        return
+
+    mention = make_mention(user)
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Я человек ✓", callback_data=f"verify:{user.id}")]]
+    )
+    try:
+        await context.bot.send_message(
+            chat.id,
+            f"{mention}, добро пожаловать! Нажми кнопку, чтобы подтвердить, что ты не бот.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        pass
+
+
+async def verify_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    target_id = int(query.data.split(":")[1])
+
+    member = await chat.get_member(query.from_user.id)
+    if query.from_user.id != target_id and member.status not in ADMIN_STATUSES:
+        await query.answer("Только сам пользователь или администратор может подтвердить!", show_alert=True)
+        return
+
+    try:
+        await chat.restrict_member(target_id, permissions=UNMUTE_PERMS)
+    except Exception:
+        await query.answer("Не удалось размутить. Проверьте, что бот администратор.", show_alert=True)
+        return
+
+    add_verified(chat.id, target_id)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await query.answer("Добро пожаловать!")
 
 
 async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,7 +561,7 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     level = query.data.split(":", 1)[1]
-    chat_level[chat.id] = level
+    chat_config[chat.id]["level"] = level
     save_settings()
 
     text = "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
@@ -440,6 +587,104 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"Уровень: {level}")
 
 
+async def banword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /banword работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут добавлять слова.")
+        return
+
+    parts = (msg.text or "").strip().split()
+    if len(parts) < 2:
+        await msg.reply_text("Использование: /banword <слово>")
+        return
+
+    word = parts[1].lower()
+    words = chat_config[chat.id]["words"]
+    if word in words:
+        await msg.reply_text("Это слово уже в бан-списке.")
+        return
+
+    words.append(word)
+    save_settings()
+    await msg.reply_text(f"Слово «{word}» добавлено в бан-список ({len(words)} слов).")
+
+
+async def unbanword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /unbanword работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут удалять слова.")
+        return
+
+    parts = (msg.text or "").strip().split()
+    if len(parts) < 2:
+        await msg.reply_text("Использование: /unbanword <слово>")
+        return
+
+    word = parts[1].lower()
+    words = chat_config[chat.id]["words"]
+    if word not in words:
+        await msg.reply_text("Такого слова нет в бан-списке.")
+        return
+
+    words.remove(word)
+    save_settings()
+    await msg.reply_text(f"Слово «{word}» удалено из бан-списка.")
+
+
+async def words_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    words = chat_config[chat.id]["words"]
+    if not words:
+        await msg.reply_text("Бан-список пуст. Добавьте слово командой /banword <слово>")
+        return
+    await msg.reply_text("Бан-слова:\n" + "\n".join(f"- {w}" for w in words))
+
+
+async def captcha_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /captcha работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут менять капчу.")
+        return
+
+    parts = (msg.text or "").strip().split()
+    if len(parts) < 2 or parts[1] not in ("on", "off"):
+        state = "включена" if chat_config[chat.id]["captcha"] else "выключена"
+        await msg.reply_text(
+            f"Капча для новичков: {state}\n"
+            "/captcha on - включить\n"
+            "/captcha off - выключить"
+        )
+        return
+
+    chat_config[chat.id]["captcha"] = parts[1] == "on"
+    save_settings()
+    await msg.reply_text(
+        f"Капча для новичков {'включена' if chat_config[chat.id]['captcha'] else 'выключена'}."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if update.effective_chat.type != "private":
@@ -448,10 +693,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я бот-защитник групп. \n\n"
         "Слежу за порядком, удаляю сообщения нарушителей и мучу их на 3 часа:\n"
         "- флуд, спам одинаковыми сообщениями\n"
-        "- спам ссылками\n"
-        "- мат\n\n"
+        "- спам ссылками и массовыми упоминаниями\n"
+        "- мат (включая ваши бан-слова)\n"
+        "- флуд медиа, спам пересылками, КАПС\n"
+        "- капча для новичков (мут до нажатия кнопки)\n\n"
         "Команды для администраторов:\n"
         "/settings - настройка жёсткости (низкая/средняя/высокая)\n"
+        "/captcha on|off - капча для новичков\n"
+        "/banword <слово> - добавить бан-слово\n"
+        "/unbanword <слово> - убрать бан-слово\n"
+        "/words - список бан-слов\n"
         "/mute <@ник|id|ссылка> [минуты] [причина] - ручной мут (или ответом)\n"
         "/unmute <@ник|id|ссылка> - размут (или ответом)\n\n"
         "Добавьте меня в группу администратором, и я начну работать."
@@ -476,16 +727,22 @@ def main():
     app.add_handler(CommandHandler("unmute", unmute))
     app.add_handler(CommandHandler("mute", mute_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("banword", banword_cmd))
+    app.add_handler(CommandHandler("unbanword", unbanword_cmd))
+    app.add_handler(CommandHandler("words", words_cmd))
+    app.add_handler(CommandHandler("captcha", captcha_cmd))
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
+    app.add_handler(CallbackQueryHandler(verify_cb, pattern=r"^verify:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
 
 
 if __name__ == "__main__":
