@@ -33,6 +33,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    MyChatMemberHandler,
     filters,
 )
 
@@ -118,6 +119,9 @@ UNMUTE_PERMS = ChatPermissions(
 
 ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
+chat_config = defaultdict(_new_chat_config)
+tracked_groups = set()  # чаты, где бот должен следить за правами других ботов
+
 
 def load_settings():
     global chat_config
@@ -138,6 +142,7 @@ def load_settings():
                 cfg["max_user_id"] = int(value.get("max_user_id", 0))
                 cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
                 chat_config[cid] = cfg
+        tracked_groups.update(chat_config.keys())
     except Exception:
         pass
 
@@ -327,6 +332,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not is_group(chat) or not msg or not msg.from_user or msg.from_user.is_bot:
         return
+
+    tracked_groups.add(chat.id)
 
     if (
         msg.reply_to_message
@@ -550,6 +557,8 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Команда /settings работает только в группах.")
         return
 
+    tracked_groups.add(chat.id)
+
     member = await chat.get_member(user.id)
     if member.status not in ADMIN_STATUSES:
         await msg.reply_text("Только администраторы могут менять настройки.")
@@ -717,6 +726,59 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Готово")
 
 
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not is_group(chat):
+        return
+    status = update.my_chat_member.new_chat_member.status
+    if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+        tracked_groups.add(chat.id)
+    else:
+        tracked_groups.discard(chat.id)
+
+
+async def enforce_bot_rights(context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot
+    for chat_id in list(tracked_groups):
+        try:
+            chat = await bot.get_chat(chat_id)
+            if not is_group(chat):
+                continue
+            my = await chat.get_member(bot.id)
+            if my.status != ChatMemberStatus.ADMINISTRATOR:
+                continue
+            admins = await chat.get_administrators()
+        except Exception:
+            continue
+        for admin in admins:
+            if admin.status == ChatMemberStatus.OWNER:
+                continue
+            u = admin.user
+            if not u.is_bot or u.id == bot.id or not admin.can_restrict_members:
+                continue
+            try:
+                await chat.promote_member(
+                    u.id,
+                    is_anonymous=admin.is_anonymous,
+                    can_manage_chat=admin.can_manage_chat,
+                    can_delete_messages=admin.can_delete_messages,
+                    can_manage_video_chats=admin.can_manage_video_chats,
+                    can_restrict_members=False,
+                    can_promote_members=admin.can_promote_members,
+                    can_change_info=admin.can_change_info,
+                    can_invite_users=admin.can_invite_users,
+                    can_pin_messages=admin.can_pin_messages,
+                    can_manage_topics=admin.can_manage_topics,
+                )
+                await bot.send_message(
+                    chat_id,
+                    f"У бота {make_mention(u)} отобрано право управления участниками.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+
 async def banword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -874,13 +936,15 @@ def main():
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
+    app.add_handler(MyChatMemberHandler(on_my_chat_member))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+    app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
 
 
 if __name__ == "__main__":
