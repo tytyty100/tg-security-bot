@@ -29,6 +29,7 @@ from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -41,6 +42,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 MUTE_MINUTES = 180  # 3 часа
+
+# Оценка "возраста" аккаунта по номеру id (Telegram не отдаёт дату создания).
+# Чем новее аккаунт, тем выше id. Если id нового участника близко к максимальному
+# из виденных ботом — аккаунт создан совсем недавно.
+BAN_MARGIN = 100        # id новее максимального на <= 100 => аккаунт создан ~минуту назад
+WEEK_MARGIN = 500_000   # id новее максимального на <= 500к => аккаунт создан ~неделю назад
 
 DEFAULT_LEVEL = "низкая"
 LEVELS = {
@@ -82,7 +89,7 @@ MAT_PHRASES = (
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": []}
+    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -127,6 +134,8 @@ def load_settings():
                 cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
                 cfg["words"] = [str(w).lower() for w in value.get("words", [])]
                 cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
+                cfg["account_check"] = bool(value.get("account_check", False))
+                cfg["max_user_id"] = int(value.get("max_user_id", 0))
                 chat_config[cid] = cfg
     except Exception:
         pass
@@ -160,6 +169,34 @@ def level_desc(level: str) -> str:
         f"- спам пересылками: {fv_n}+ за {fv_w} сек\n"
         f"- массовые упоминания: {cfg['mentions']}+\n"
     )
+
+
+def settings_text(level: str) -> str:
+    return "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
+        f"\nТекущая: {level}"
+
+
+def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
+    check = chat_config[chat_id]["account_check"]
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"Низкая {'✓' if level == 'низкая' else ''}",
+            callback_data="harshness:низкая",
+        ),
+        InlineKeyboardButton(
+            f"Средняя {'✓' if level == 'средняя' else ''}",
+            callback_data="harshness:средняя",
+        ),
+        InlineKeyboardButton(
+            f"Высокая {'✓' if level == 'высокая' else ''}",
+            callback_data="harshness:высокая",
+        ),
+    ], [
+        InlineKeyboardButton(
+            f"Проверка аккаунтов: {'✓ вкл' if check else 'выкл'}",
+            callback_data="account_check",
+        ),
+    ]])
 
 
 def is_group(chat) -> bool:
@@ -504,23 +541,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     level = get_level(chat.id)
-    text = "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
-        f"\nТекущая: {level}"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"Низкая {'✓' if level == 'низкая' else ''}",
-            callback_data="harshness:низкая",
-        ),
-        InlineKeyboardButton(
-            f"Средняя {'✓' if level == 'средняя' else ''}",
-            callback_data="harshness:средняя",
-        ),
-        InlineKeyboardButton(
-            f"Высокая {'✓' if level == 'высокая' else ''}",
-            callback_data="harshness:высокая",
-        ),
-    ]])
-    await msg.reply_text(text, reply_markup=kb)
+    await msg.reply_text(settings_text(level), reply_markup=settings_markup(chat.id, level))
 
 
 async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -535,27 +556,90 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_config[chat.id]["level"] = level
     save_settings()
 
-    text = "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
-        f"\nТекущая: {level}"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"Низкая {'✓' if level == 'низкая' else ''}",
-            callback_data="harshness:низкая",
-        ),
-        InlineKeyboardButton(
-            f"Средняя {'✓' if level == 'средняя' else ''}",
-            callback_data="harshness:средняя",
-        ),
-        InlineKeyboardButton(
-            f"Высокая {'✓' if level == 'высокая' else ''}",
-            callback_data="harshness:высокая",
-        ),
-    ]])
     try:
-        await query.message.edit_text(text, reply_markup=kb)
+        await query.message.edit_text(
+            settings_text(level),
+            reply_markup=settings_markup(chat.id, level),
+        )
     except Exception:
         pass
     await query.answer(f"Уровень: {level}")
+
+
+async def account_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer("Только администраторы могут менять настройки!", show_alert=True)
+        return
+
+    chat_config[chat.id]["account_check"] = not chat_config[chat.id]["account_check"]
+    save_settings()
+
+    try:
+        await query.message.edit_text(
+            settings_text(get_level(chat.id)),
+            reply_markup=settings_markup(chat.id, get_level(chat.id)),
+        )
+    except Exception:
+        pass
+    await query.answer(
+        f"Проверка аккаунтов: {'включена' if chat_config[chat.id]['account_check'] else 'выключена'}"
+    )
+
+
+async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not is_group(chat):
+        return
+
+    change = update.chat_member
+    new = change.new_chat_member
+    if not new or new.status != ChatMemberStatus.MEMBER:
+        return
+
+    user = new.user
+    if user.is_bot:
+        return
+
+    if not chat_config[chat.id]["account_check"]:
+        return
+
+    wm = chat_config[chat.id]["max_user_id"]
+    if wm == 0:
+        chat_config[chat.id]["max_user_id"] = user.id
+        save_settings()
+        return
+
+    diff = wm - user.id
+    if user.id > wm:
+        chat_config[chat.id]["max_user_id"] = user.id
+        save_settings()
+
+    mention = make_mention(user)
+    if diff <= BAN_MARGIN:
+        try:
+            await chat.ban_member(user.id)
+        except Exception:
+            return
+        try:
+            await context.bot.send_message(
+                chat.id,
+                f"{mention} забанен: вероятно рейдер (аккаунт создан совсем недавно).",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    elif diff <= WEEK_MARGIN:
+        try:
+            await context.bot.send_message(
+                chat.id,
+                f"⚠️ Внимание, подозрение на рейдера! {mention} (аккаунт создан меньше недели назад).",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 async def banword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,7 +761,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- спам ссылками и массовыми упоминаниями\n"
         "- пингование администраторов\n"
         "- мат (включая ваши бан-слова)\n"
-        "- флуд медиа и спам пересылками\n\n"
+        "- флуд медиа и спам пересылками\n"
+        "- проверка аккаунтов новых участников (в /settings)\n\n"
         "Команды для администраторов:\n"
         "/settings - настройка жёсткости (низкая/средняя/высокая)\n"
         "/banword <слово> - добавить бан-слово\n"
@@ -715,13 +800,15 @@ def main():
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
+    app.add_handler(CallbackQueryHandler(account_check_cb, pattern=r"^account_check$"))
+    app.add_handler(ChatMemberHandler(on_new_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_member"])
 
 
 if __name__ == "__main__":
