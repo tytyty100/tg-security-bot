@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import socket
 import sys
@@ -65,6 +66,14 @@ MAT_ROOTS = (
 MAT_PATTERN = re.compile(
     "(?:{})|(?<![а-яё])манда(?![а-яё])".format("|".join(re.escape(w) for w in MAT_ROOTS)),
     re.IGNORECASE,
+)
+
+MAT_PHRASES = (
+    "и давно тебе 17?",
+    "мда..",
+    "ты типо крутой ругаешься матами да?",
+    "уже звоню твоей маме рассказывать!",
+    "згс гордится тобой!",
 )
 
 
@@ -264,6 +273,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group(chat) or not msg or not msg.from_user or msg.from_user.is_bot:
         return
 
+    if (
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and msg.reply_to_message.from_user.is_bot
+        and msg.reply_to_message.text == "и давно тебе 17?"
+        and "уже да" in (msg.text or "").lower()
+    ):
+        await msg.reply_text("суммерки")
+        return
+
     user = msg.from_user
     member = await chat.get_member(user.id)
     if member.status in ADMIN_STATUSES:
@@ -322,6 +341,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         mat_count = len(MAT_PATTERN.findall(txt))
+        if mat_count >= 1:
+            await update.effective_message.reply_text(random.choice(MAT_PHRASES))
         if mat_count >= mat_n:
             await mute_user(update, user, "мат", delete_ids=[msg.message_id])
             clear_tracks(chat.id, user.id)
