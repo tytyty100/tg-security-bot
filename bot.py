@@ -44,10 +44,10 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 MUTE_MINUTES = 180  # 3 часа
 
 # Оценка "возраста" аккаунта по номеру id (Telegram не отдаёт дату создания).
-# Чем новее аккаунт, тем выше id. Если id нового участника близко к максимальному
-# из виденных ботом — аккаунт создан совсем недавно.
-BAN_MARGIN = 100        # id новее максимального на <= 100 => аккаунт создан ~минуту назад
-WEEK_MARGIN = 500_000   # id новее максимального на <= 500к => аккаунт создан ~неделю назад
+# Чем новее аккаунт, тем выше id. За базу берётся максимальный id, виденный ботом
+# в чате (засеивается из всех участников при включении проверки).
+BAN_MARGIN = 500        # id новее базы на <= 500 => аккаунт создан ~минуту назад
+WEEK_MARGIN = 1_000_000  # id новее базы на <= 1 млн => аккаунт создан ~неделю назад
 
 DEFAULT_LEVEL = "низкая"
 LEVELS = {
@@ -89,7 +89,7 @@ MAT_PHRASES = (
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0}
+    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0, "skip_join": []}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -136,6 +136,7 @@ def load_settings():
                 cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
                 cfg["account_check"] = bool(value.get("account_check", False))
                 cfg["max_user_id"] = int(value.get("max_user_id", 0))
+                cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
                 chat_config[cid] = cfg
     except Exception:
         pass
@@ -151,6 +152,25 @@ def save_settings():
 
 def get_level(chat_id: int) -> str:
     return chat_config[chat_id]["level"]
+
+
+def note_user_id(chat_id: int, user_id: int):
+    if user_id > chat_config[chat_id]["max_user_id"]:
+        chat_config[chat_id]["max_user_id"] = user_id
+        save_settings()
+
+
+async def seed_max_user_id(chat):
+    highest = 0
+    try:
+        async for member in chat.get_members():
+            if member.user and member.user.id > highest:
+                highest = member.user.id
+    except Exception:
+        return
+    if highest > chat_config[chat.id]["max_user_id"]:
+        chat_config[chat.id]["max_user_id"] = highest
+        save_settings()
 
 
 def level_desc(level: str) -> str:
@@ -325,6 +345,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = msg.from_user
+    note_user_id(chat.id, user.id)
     member = await chat.get_member(user.id)
     if member.status in ADMIN_STATUSES:
         return
@@ -577,6 +598,9 @@ async def account_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_config[chat.id]["account_check"] = not chat_config[chat.id]["account_check"]
     save_settings()
 
+    if chat_config[chat.id]["account_check"]:
+        await seed_max_user_id(chat)
+
     try:
         await query.message.edit_text(
             settings_text(get_level(chat.id)),
@@ -598,6 +622,8 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new = change.new_chat_member
     if not new or new.status != ChatMemberStatus.MEMBER:
         return
+    if change.old_chat_member and change.old_chat_member.status == ChatMemberStatus.MEMBER:
+        return  # апдейт после мута/размута, а не новый вход в чат
 
     user = new.user
     if user.is_bot:
@@ -606,6 +632,10 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat_config[chat.id]["account_check"]:
         return
 
+    if user.id in chat_config[chat.id]["skip_join"]:
+        return
+
+    note_user_id(chat.id, user.id)
     wm = chat_config[chat.id]["max_user_id"]
     if wm == 0:
         chat_config[chat.id]["max_user_id"] = user.id
@@ -613,10 +643,6 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     diff = wm - user.id
-    if user.id > wm:
-        chat_config[chat.id]["max_user_id"] = user.id
-        save_settings()
-
     mention = make_mention(user)
     if diff <= BAN_MARGIN:
         until = datetime.now(timezone.utc) + timedelta(minutes=MUTE_MINUTES)
@@ -655,10 +681,13 @@ async def skip_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = query.message.chat
     member = await chat.get_member(query.from_user.id)
     if member.status not in ADMIN_STATUSES:
-        await query.answer("Только администраторы могут это делать!", show_alert=True)
+        await query.answer()
         return
 
     target_id = int(query.data.split(":")[1])
+    if target_id not in chat_config[chat.id]["skip_join"]:
+        chat_config[chat.id]["skip_join"].append(target_id)
+        save_settings()
     try:
         await chat.restrict_member(target_id, permissions=UNMUTE_PERMS)
     except Exception:
@@ -677,7 +706,7 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = query.message.chat
     member = await chat.get_member(query.from_user.id)
     if member.status not in ADMIN_STATUSES:
-        await query.answer("Только администраторы могут это делать!", show_alert=True)
+        await query.answer()
         return
 
     target_id = int(query.data.split(":")[1])
