@@ -20,7 +20,6 @@ def _ipv4_only_getaddrinfo(*args, **kwargs):
 socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from telegram import (
-    Bot,
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -41,11 +40,6 @@ from config import TOKEN
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-
-try:
-    SETTINGS_CHAT_ID = int(os.environ.get("SETTINGS_CHAT_ID", "") or 0) or None
-except Exception:
-    SETTINGS_CHAT_ID = None
 
 MUTE_MINUTES = 180  # 3 часа
 
@@ -95,10 +89,12 @@ MAT_PHRASES = (
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True}
+    return {"level": DEFAULT_LEVEL, "ping_whitelist": [], "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True}
 
 
 chat_config = defaultdict(_new_chat_config)
+tracked_groups = set()  # чаты, где бот должен следить за правами других ботов
+
 history = defaultdict(lambda: defaultdict(deque))       # chat -> user -> deque[(time, message_id)]
 text_history = defaultdict(lambda: defaultdict(deque))  # chat -> user -> deque[(text, time, message_id)]
 media_history = defaultdict(lambda: defaultdict(deque))      # chat -> user -> deque[(time, message_id)]
@@ -124,101 +120,36 @@ UNMUTE_PERMS = ChatPermissions(
 
 ADMIN_STATUSES = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
-chat_config = defaultdict(_new_chat_config)
-tracked_groups = set()  # чаты, где бот должен следить за правами других ботов
-
-
-def apply_settings(data):
-    global chat_config
-    chat_config = defaultdict(_new_chat_config)
-    for key, value in data.items():
-        cid = int(key)
-        if isinstance(value, str):
-            chat_config[cid]["level"] = value if value in LEVELS else DEFAULT_LEVEL
-        elif isinstance(value, dict):
-            cfg = _new_chat_config()
-            cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
-            cfg["words"] = [str(w).lower() for w in value.get("words", [])]
-            cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
-            cfg["account_check"] = bool(value.get("account_check", False))
-            cfg["max_user_id"] = int(value.get("max_user_id", 0))
-            cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
-            cfg["pranks"] = bool(value.get("pranks", True))
-            cfg["bot_check"] = bool(value.get("bot_check", True))
-            chat_config[cid] = cfg
-    tracked_groups.update(chat_config.keys())
-
 
 def load_settings():
+    global chat_config
+    chat_config = defaultdict(_new_chat_config)
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        apply_settings(data)
+        for key, value in data.items():
+            cid = int(key)
+            if isinstance(value, str):
+                chat_config[cid]["level"] = value if value in LEVELS else DEFAULT_LEVEL
+            elif isinstance(value, dict):
+                cfg = _new_chat_config()
+                cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
+                cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
+                cfg["account_check"] = bool(value.get("account_check", False))
+                cfg["max_user_id"] = int(value.get("max_user_id", 0))
+                cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
+                cfg["pranks"] = bool(value.get("pranks", True))
+                cfg["bot_check"] = bool(value.get("bot_check", True))
+                chat_config[cid] = cfg
+        tracked_groups.update(chat_config.keys())
     except Exception:
         pass
-
-
-def settings_payload() -> str:
-    return json.dumps({str(k): v for k, v in chat_config.items()}, ensure_ascii=False, indent=2)
 
 
 def save_settings():
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            f.write(settings_payload())
-    except Exception:
-        pass
-    if SETTINGS_CHAT_ID:
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(push_settings_to_channel())
-        except Exception:
-            pass
-
-
-_push_lock = asyncio.Lock()
-
-
-async def push_settings_to_channel():
-    if not SETTINGS_CHAT_ID:
-        return
-    async with _push_lock:
-        try:
-            b = Bot(TOKEN)
-            payload = settings_payload()
-            pinned = await b.get_chat_pinned_message(SETTINGS_CHAT_ID)
-            if pinned and pinned.text:
-                try:
-                    json.loads(pinned.text)
-                    is_ours = True
-                except Exception:
-                    is_ours = False
-                if is_ours:
-                    await b.edit_message_text(
-                        payload, chat_id=SETTINGS_CHAT_ID, message_id=pinned.message_id
-                    )
-                    return
-            m = await b.send_message(SETTINGS_CHAT_ID, payload)
-            try:
-                await b.pin_chat_message(SETTINGS_CHAT_ID, m.message_id)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-
-async def sync_settings_from_channel(bot):
-    if not SETTINGS_CHAT_ID:
-        return
-    try:
-        pinned = await bot.get_chat_pinned_message(SETTINGS_CHAT_ID)
-        if not pinned or not pinned.text:
-            return
-        data = json.loads(pinned.text)
-        if not isinstance(data, dict):
-            return
-        apply_settings(data)
-        save_settings()
+            json.dump({str(k): v for k, v in chat_config.items()}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -491,17 +422,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await mute_user(update, user, "мат", delete_ids=[msg.message_id])
             clear_tracks(chat.id, user.id)
             return
-
-        words = chat_config[chat.id]["words"]
-        if words:
-            matched = [w for w in words if re.search(re.escape(w), txt, re.IGNORECASE)]
-            if matched:
-                await mute_user(
-                    update, user, f"бан-слово «{matched[0]}»",
-                    delete_ids=[msg.message_id],
-                )
-                clear_tracks(chat.id, user.id)
-                return
 
         mention_count = 0
         pings_admin = False
@@ -861,15 +781,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tracked_groups.add(chat.id)
         else:
             tracked_groups.discard(chat.id)
-    elif chat.type == "channel" and status == ChatMemberStatus.ADMINISTRATOR:
-        try:
-            await context.bot.send_message(
-                chat.id,
-                "Этот канал будет хранилищем настроек бота.\n"
-                f"Вставь в Render → Environment переменную SETTINGS_CHAT_ID со значением: {chat.id}",
-            )
-        except Exception:
-            pass
 
 
 async def enforce_bot_rights(context: ContextTypes.DEFAULT_TYPE):
@@ -914,92 +825,6 @@ async def enforce_bot_rights(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
-
-
-async def banword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if not is_group(chat):
-        await msg.reply_text("Команда /banword работает только в группах.")
-        return
-
-    member = await chat.get_member(user.id)
-    if member.status not in ADMIN_STATUSES:
-        await msg.reply_text("Только администраторы могут добавлять слова.")
-        return
-
-    parts = (msg.text or "").strip().split()
-    if len(parts) < 2:
-        await msg.reply_text("Использование: /banword <слово>")
-        return
-
-    word = parts[1].lower()
-    words = chat_config[chat.id]["words"]
-    if word in words:
-        await msg.reply_text("Это слово уже в бан-списке.")
-        return
-
-    words.append(word)
-    save_settings()
-    await msg.reply_text(f"Слово «{word}» добавлено в бан-список ({len(words)} слов).")
-
-
-async def unbanword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if not is_group(chat):
-        await msg.reply_text("Команда /unbanword работает только в группах.")
-        return
-
-    member = await chat.get_member(user.id)
-    if member.status not in ADMIN_STATUSES:
-        await msg.reply_text("Только администраторы могут удалять слова.")
-        return
-
-    parts = (msg.text or "").strip().split()
-    if len(parts) < 2:
-        await msg.reply_text("Использование: /unbanword <слово>")
-        return
-
-    word = parts[1].lower()
-    words = chat_config[chat.id]["words"]
-    if word not in words:
-        await msg.reply_text("Такого слова нет в бан-списке.")
-        return
-
-    words.remove(word)
-    save_settings()
-    await msg.reply_text(f"Слово «{word}» удалено из бан-списка.")
-
-
-async def words_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    words = chat_config[chat.id]["words"]
-    if not words:
-        await msg.reply_text("Бан-список пуст. Добавьте слово командой /banword <слово>")
-        return
-    await msg.reply_text("Бан-слова:\n" + "\n".join(f"- {w}" for w in words))
-
-
-async def clearbanwords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if not is_group(chat):
-        await msg.reply_text("Команда /clearbanwords работает только в группах.")
-        return
-
-    member = await chat.get_member(user.id)
-    if member.status not in ADMIN_STATUSES:
-        await msg.reply_text("Только администраторы могут очищать список.")
-        return
-
-    chat_config[chat.id]["words"] = []
-    save_settings()
-    await msg.reply_text("Бан-слова очищены.")
 
 
 async def stopbanuserme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1053,14 +878,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- флуд, спам одинаковыми сообщениями\n"
         "- спам ссылками и массовыми упоминаниями\n"
         "- пингование администраторов\n"
-        "- мат (включая ваши бан-слова)\n"
+        "- мат\n"
         "- флуд медиа и спам пересылками\n\n"
         "Команды для администраторов:\n"
         "/settings - настройки (жёсткость, приколюхи, проверка прав ботов)\n"
-        "/banword <слово> - добавить бан-слово\n"
-        "/unbanword <слово> - убрать бан-слово\n"
-        "/banwords - список бан-слов\n"
-        "/clearbanwords - очистить список бан-слов\n"
         "/mute <@ник|id|ссылка> [минуты] [причина] - ручной мут (или ответом)\n"
         "/unmute <@ник|id|ссылка> - размут (или ответом)\n\n"
         "Добавьте меня в группу администратором, и я начну работать."
@@ -1085,10 +906,6 @@ def main():
     app.add_handler(CommandHandler("unmute", unmute))
     app.add_handler(CommandHandler("mute", mute_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("banword", banword_cmd))
-    app.add_handler(CommandHandler("unbanword", unbanword_cmd))
-    app.add_handler(CommandHandler("banwords", words_cmd))
-    app.add_handler(CommandHandler("clearbanwords", clearbanwords_cmd))
     app.add_handler(CommandHandler("stopbanuserme", stopbanuserme_cmd))
     app.add_handler(CommandHandler("gobanuserme", gobanuserme_cmd))
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
@@ -1099,11 +916,6 @@ def main():
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
-
-    async def post_init(application):
-        await sync_settings_from_channel(application.bot)
-
-    app.post_init = post_init
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
