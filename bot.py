@@ -89,7 +89,7 @@ MAT_PHRASES = (
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0, "skip_join": []}
+    return {"level": DEFAULT_LEVEL, "words": [], "ping_whitelist": [], "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -140,6 +140,8 @@ def load_settings():
                 cfg["account_check"] = bool(value.get("account_check", False))
                 cfg["max_user_id"] = int(value.get("max_user_id", 0))
                 cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
+                cfg["pranks"] = bool(value.get("pranks", True))
+                cfg["bot_check"] = bool(value.get("bot_check", True))
                 chat_config[cid] = cfg
         tracked_groups.update(chat_config.keys())
     except Exception:
@@ -201,6 +203,8 @@ def settings_text(level: str) -> str:
 
 
 def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
+    pranks = chat_config[chat_id]["pranks"]
+    bot_check = chat_config[chat_id]["bot_check"]
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"Низкая {'✓' if level == 'низкая' else ''}",
@@ -213,6 +217,16 @@ def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             f"Высокая {'✓' if level == 'высокая' else ''}",
             callback_data="harshness:высокая",
+        ),
+    ], [
+        InlineKeyboardButton(
+            f"Приколюхи: {'✓ вкл' if pranks else 'выкл'}",
+            callback_data="pranks",
+        ),
+    ], [
+        InlineKeyboardButton(
+            f"Проверка прав ботов: {'✓ вкл' if bot_check else 'выкл'}",
+            callback_data="bot_check",
         ),
     ]])
 
@@ -335,7 +349,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracked_groups.add(chat.id)
 
     if (
-        msg.reply_to_message
+        chat_config[chat.id]["pranks"]
+        and msg.reply_to_message
         and msg.reply_to_message.from_user
         and msg.reply_to_message.from_user.is_bot
         and msg.reply_to_message.text == "и давно тебе 17?"
@@ -403,7 +418,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         mat_count = len(MAT_PATTERN.findall(txt))
-        if mat_count >= 1:
+        if mat_count >= 1 and chat_config[chat.id]["pranks"] and random.random() < 0.5:
             await update.effective_message.reply_text(random.choice(MAT_PHRASES))
         if mat_count >= mat_n:
             await mute_user(update, user, "мат", delete_ids=[msg.message_id])
@@ -589,6 +604,52 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"Уровень: {level}")
 
 
+async def pranks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer()
+        return
+
+    chat_config[chat.id]["pranks"] = not chat_config[chat.id]["pranks"]
+    save_settings()
+
+    try:
+        await query.message.edit_text(
+            settings_text(get_level(chat.id)),
+            reply_markup=settings_markup(chat.id, get_level(chat.id)),
+        )
+    except Exception:
+        pass
+    await query.answer(
+        f"Приколюхи: {'включены' if chat_config[chat.id]['pranks'] else 'выключены'}"
+    )
+
+
+async def bot_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer()
+        return
+
+    chat_config[chat.id]["bot_check"] = not chat_config[chat.id]["bot_check"]
+    save_settings()
+
+    try:
+        await query.message.edit_text(
+            settings_text(get_level(chat.id)),
+            reply_markup=settings_markup(chat.id, get_level(chat.id)),
+        )
+    except Exception:
+        pass
+    await query.answer(
+        f"Проверка прав ботов: {'включена' if chat_config[chat.id]['bot_check'] else 'выключена'}"
+    )
+
+
 async def account_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat = query.message.chat
@@ -739,6 +800,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def enforce_bot_rights(context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
     for chat_id in list(tracked_groups):
+        if not chat_config[chat_id]["bot_check"]:
+            continue
         try:
             chat = await bot.get_chat(chat_id)
             if not is_group(chat):
@@ -846,6 +909,24 @@ async def words_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("Бан-слова:\n" + "\n".join(f"- {w}" for w in words))
 
 
+async def clearbanwords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not is_group(chat):
+        await msg.reply_text("Команда /clearbanwords работает только в группах.")
+        return
+
+    member = await chat.get_member(user.id)
+    if member.status not in ADMIN_STATUSES:
+        await msg.reply_text("Только администраторы могут очищать список.")
+        return
+
+    chat_config[chat.id]["words"] = []
+    save_settings()
+    await msg.reply_text("Бан-слова очищены.")
+
+
 async def stopbanuserme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -891,7 +972,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     text = (
-        "Привет! Я бот-защитник групп. \n\n"
+        "Привет! Я бот-защитник групп, создан для сообщества "
+        "**Zoro Game Store** и **С.О.К.**\n\n"
         "Слежу за порядком, удаляю сообщения нарушителей и мучу их на 3 часа:\n"
         "- флуд, спам одинаковыми сообщениями\n"
         "- спам ссылками и массовыми упоминаниями\n"
@@ -899,10 +981,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- мат (включая ваши бан-слова)\n"
         "- флуд медиа и спам пересылками\n\n"
         "Команды для администраторов:\n"
-        "/settings - настройка жёсткости (низкая/средняя/высокая)\n"
+        "/settings - настройки (жёсткость, приколюхи, проверка прав ботов)\n"
         "/banword <слово> - добавить бан-слово\n"
         "/unbanword <слово> - убрать бан-слово\n"
-        "/words - список бан-слов\n"
+        "/banwords - список бан-слов\n"
+        "/clearbanwords - очистить список бан-слов\n"
         "/mute <@ник|id|ссылка> [минуты] [причина] - ручной мут (или ответом)\n"
         "/unmute <@ник|id|ссылка> - размут (или ответом)\n\n"
         "Добавьте меня в группу администратором, и я начну работать."
@@ -929,12 +1012,15 @@ def main():
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("banword", banword_cmd))
     app.add_handler(CommandHandler("unbanword", unbanword_cmd))
-    app.add_handler(CommandHandler("words", words_cmd))
+    app.add_handler(CommandHandler("banwords", words_cmd))
+    app.add_handler(CommandHandler("clearbanwords", clearbanwords_cmd))
     app.add_handler(CommandHandler("stopbanuserme", stopbanuserme_cmd))
     app.add_handler(CommandHandler("gobanuserme", gobanuserme_cmd))
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
+    app.add_handler(CallbackQueryHandler(pranks_cb, pattern=r"^pranks$"))
+    app.add_handler(CallbackQueryHandler(bot_check_cb, pattern=r"^bot_check$"))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
