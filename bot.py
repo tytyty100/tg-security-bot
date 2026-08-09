@@ -20,6 +20,7 @@ def _ipv4_only_getaddrinfo(*args, **kwargs):
 socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 from telegram import (
+    Bot,
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -40,6 +41,11 @@ from config import TOKEN
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+
+try:
+    SETTINGS_CHAT_ID = int(os.environ.get("SETTINGS_CHAT_ID", "") or 0) or None
+except Exception:
+    SETTINGS_CHAT_ID = None
 
 MUTE_MINUTES = 180  # 3 часа
 
@@ -122,36 +128,97 @@ chat_config = defaultdict(_new_chat_config)
 tracked_groups = set()  # чаты, где бот должен следить за правами других ботов
 
 
-def load_settings():
+def apply_settings(data):
     global chat_config
     chat_config = defaultdict(_new_chat_config)
+    for key, value in data.items():
+        cid = int(key)
+        if isinstance(value, str):
+            chat_config[cid]["level"] = value if value in LEVELS else DEFAULT_LEVEL
+        elif isinstance(value, dict):
+            cfg = _new_chat_config()
+            cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
+            cfg["words"] = [str(w).lower() for w in value.get("words", [])]
+            cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
+            cfg["account_check"] = bool(value.get("account_check", False))
+            cfg["max_user_id"] = int(value.get("max_user_id", 0))
+            cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
+            cfg["pranks"] = bool(value.get("pranks", True))
+            cfg["bot_check"] = bool(value.get("bot_check", True))
+            chat_config[cid] = cfg
+    tracked_groups.update(chat_config.keys())
+
+
+def load_settings():
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        for key, value in data.items():
-            cid = int(key)
-            if isinstance(value, str):
-                chat_config[cid]["level"] = value if value in LEVELS else DEFAULT_LEVEL
-            elif isinstance(value, dict):
-                cfg = _new_chat_config()
-                cfg["level"] = value.get("level", DEFAULT_LEVEL) if value.get("level") in LEVELS else DEFAULT_LEVEL
-                cfg["words"] = [str(w).lower() for w in value.get("words", [])]
-                cfg["ping_whitelist"] = [int(u) for u in value.get("ping_whitelist", [])]
-                cfg["account_check"] = bool(value.get("account_check", False))
-                cfg["max_user_id"] = int(value.get("max_user_id", 0))
-                cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
-                cfg["pranks"] = bool(value.get("pranks", True))
-                cfg["bot_check"] = bool(value.get("bot_check", True))
-                chat_config[cid] = cfg
-        tracked_groups.update(chat_config.keys())
+        apply_settings(data)
     except Exception:
         pass
+
+
+def settings_payload() -> str:
+    return json.dumps({str(k): v for k, v in chat_config.items()}, ensure_ascii=False, indent=2)
 
 
 def save_settings():
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in chat_config.items()}, f, ensure_ascii=False, indent=2)
+            f.write(settings_payload())
+    except Exception:
+        pass
+    if SETTINGS_CHAT_ID:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(push_settings_to_channel())
+        except Exception:
+            pass
+
+
+_push_lock = asyncio.Lock()
+
+
+async def push_settings_to_channel():
+    if not SETTINGS_CHAT_ID:
+        return
+    async with _push_lock:
+        try:
+            b = Bot(TOKEN)
+            payload = settings_payload()
+            pinned = await b.get_chat_pinned_message(SETTINGS_CHAT_ID)
+            if pinned and pinned.text:
+                try:
+                    json.loads(pinned.text)
+                    is_ours = True
+                except Exception:
+                    is_ours = False
+                if is_ours:
+                    await b.edit_message_text(
+                        payload, chat_id=SETTINGS_CHAT_ID, message_id=pinned.message_id
+                    )
+                    return
+            m = await b.send_message(SETTINGS_CHAT_ID, payload)
+            try:
+                await b.pin_chat_message(SETTINGS_CHAT_ID, m.message_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+async def sync_settings_from_channel(bot):
+    if not SETTINGS_CHAT_ID:
+        return
+    try:
+        pinned = await bot.get_chat_pinned_message(SETTINGS_CHAT_ID)
+        if not pinned or not pinned.text:
+            return
+        data = json.loads(pinned.text)
+        if not isinstance(data, dict):
+            return
+        apply_settings(data)
+        save_settings()
     except Exception:
         pass
 
@@ -788,13 +855,21 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    if not is_group(chat):
-        return
     status = update.my_chat_member.new_chat_member.status
-    if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
-        tracked_groups.add(chat.id)
-    else:
-        tracked_groups.discard(chat.id)
+    if is_group(chat):
+        if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+            tracked_groups.add(chat.id)
+        else:
+            tracked_groups.discard(chat.id)
+    elif chat.type == "channel" and status == ChatMemberStatus.ADMINISTRATOR:
+        try:
+            await context.bot.send_message(
+                chat.id,
+                "Этот канал будет хранилищем настроек бота.\n"
+                f"Вставь в Render → Environment переменную SETTINGS_CHAT_ID со значением: {chat.id}",
+            )
+        except Exception:
+            pass
 
 
 async def enforce_bot_rights(context: ContextTypes.DEFAULT_TYPE):
@@ -1024,6 +1099,11 @@ def main():
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
+
+    async def post_init(application):
+        await sync_settings_from_channel(application.bot)
+
+    app.post_init = post_init
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
