@@ -915,7 +915,8 @@ def main():
     app.add_handler(CallbackQueryHandler(bot_check_cb, pattern=r"^bot_check$"))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
-    app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
+    if app.job_queue:
+        app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     if sys.platform == "win32":
