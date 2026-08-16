@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -895,13 +894,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logging.basicConfig(
-        filename=os.path.join(BASE_DIR, "bot.log"),
+        handlers=[
+            logging.FileHandler(os.path.join(BASE_DIR, "bot.log"), encoding="utf-8"),
+            logging.StreamHandler(sys.stderr),
+        ],
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        encoding="utf-8",
     )
     load_settings()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).concurrent_updates(16).build()
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("unmute", unmute))
     app.add_handler(CommandHandler("mute", mute_cmd))
@@ -919,10 +920,11 @@ def main():
         app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
+    app.run_polling(
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
+        drop_pending_updates=True,
+        bootstrap_retries=30,
+    )
 
 
 if __name__ == "__main__":
