@@ -419,6 +419,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = msg.text or msg.caption or ""
     if txt:
         link_count = txt.count("http://") + txt.count("https://") + txt.count("t.me/")
+
+        # Фильтр "самоботов": нет юзернейма + аккаунт совсем свежий + сразу льёт ссылку.
+        wm = chat_config[chat.id]["max_user_id"]
+        if (
+            not user.username
+            and link_count >= 1
+            and wm > 0
+            and (wm - user.id) <= BAN_MARGIN
+        ):
+            await mute_user(
+                update, user, "подозрение на самобота (нет ника + ссылка)",
+                delete_ids=[msg.message_id],
+            )
+            clear_tracks(chat.id, user.id)
+            return
+
         if link_count >= link_n:
             await mute_user(update, user, "спам ссылками", delete_ids=[msg.message_id])
             clear_tracks(chat.id, user.id)
