@@ -857,10 +857,6 @@ def main():
         allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
         drop_pending_updates=True,
         bootstrap_retries=30,
-        pool_timeout=30,
-        connect_timeout=10,
-        read_timeout=10,
-        write_timeout=10,
         close_loop=False,
     )
 
