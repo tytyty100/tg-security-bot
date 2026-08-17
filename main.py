@@ -62,7 +62,7 @@ def keepalive_forever():
         return
     url = url.rstrip("/") + "/health"
     while True:
-        time.sleep(600)
+        time.sleep(300)
         try:
             urllib.request.urlopen(url, timeout=10)
         except Exception:
