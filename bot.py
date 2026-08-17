@@ -42,6 +42,8 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 MUTE_MINUTES = 180  # 3 часа
 
+ALBUM_PHOTO_LIMIT = 7  # максимум фото в одном альбоме (media_group)
+
 # Оценка "возраста" аккаунта по номеру id (Telegram не отдаёт дату создания).
 # Чем новее аккаунт, тем выше id. За базу берётся максимальный id, виденный ботом
 # в чате (засеивается из всех участников при включении проверки).
@@ -105,6 +107,7 @@ history = defaultdict(lambda: defaultdict(deque))       # chat -> user -> deque[
 text_history = defaultdict(lambda: defaultdict(deque))  # chat -> user -> deque[(text, time, message_id)]
 media_history = defaultdict(lambda: defaultdict(deque))      # chat -> user -> deque[(time, message_id)]
 forward_history = defaultdict(lambda: defaultdict(deque))    # chat -> user -> deque[(time, message_id)]
+album_photos = defaultdict(lambda: defaultdict(list))        # chat -> media_group_id -> [message_id]
 
 MUTE_PERMS = ChatPermissions(can_send_messages=False)
 UNMUTE_PERMS = ChatPermissions(
@@ -388,11 +391,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_tracks(chat.id, user.id)
         return
 
+    # Лимит фото в одном альбоме (media_group): все фото альбома приходят отдельными
+    # сообщениями с общим media_group_id. Считаем их и при превышении — мут + удаление.
+    mgid = msg.media_group_id
+    is_photo_album = bool(mgid and msg.photo)
+    if is_photo_album:
+        lst = album_photos[chat.id].setdefault(mgid, [])
+        lst.append(msg.message_id)
+        if len(lst) > ALBUM_PHOTO_LIMIT:
+            await mute_user(
+                update, user, f"слишком много фото в альбоме (лимит {ALBUM_PHOTO_LIMIT})",
+                delete_ids=list(lst),
+            )
+            album_photos[chat.id].pop(mgid, None)
+            clear_tracks(chat.id, user.id)
+            return
+        # альбомные фото не считаем как флуд медиа (они обрабатываются тут)
+        if len(album_photos[chat.id]) > 300:
+            album_photos[chat.id].clear()
+
     is_media = bool(
         msg.photo or msg.video or msg.audio or msg.document or msg.voice
         or msg.video_note or msg.sticker or msg.animation
     )
-    if is_media:
+    if is_media and not is_photo_album:
         mh = media_history[chat.id][user.id]
         mh.append((now, msg.message_id))
         while mh and mh[0][0] < now - media_w:
