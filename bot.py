@@ -532,6 +532,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tracked_groups.add(chat.id)
+    if chat.id not in chat_config:
+        chat_config[chat.id]
+        save_settings()
 
     if (
         chat_config[chat.id]["pranks"]
@@ -1064,12 +1067,10 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = update.my_chat_member.new_chat_member.status
     if is_group(chat):
         if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
-if chat.id not in chat_config:
-        chat_config[chat.id]
-        save_settings()
-    tracked_groups.add(chat.id)
-            chat_config[chat.id]
-            save_settings()
+            tracked_groups.add(chat.id)
+            if chat.id not in chat_config:
+                chat_config[chat.id]
+                save_settings()
             await announce_version(context, chat.id)
         else:
             tracked_groups.discard(chat.id)
