@@ -998,53 +998,35 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Готово")
 
 
-UPDATE_TEXT = (
-    f"🛡 Бот обновлён до {BOT_VERSION}!\n"
-    f"Добавлена проверка ссылок: бот ищет вредоносные ссылки по свежим спискам "
-    f"URLhaus / phishing.army / OpenPhish.\n"
-    f"Включить: /settings → 🔗 Проверка ссылок → "
-    f"«Мутить за опасные ссылки» или «Мутить за все ссылки»."
-)
-
-
 def known_chats() -> set:
     """Все чаты, где бот работает: из настроек + те, где бот уже замечен."""
     return {int(k) for k in chat_config.keys()} | set(tracked_groups)
 
 
-async def announce_version(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
-    """Сообщение в чат при каждом запуске/перезапуске бота: что обновлено."""
-    try:
-        await context.bot.send_message(chat_id, UPDATE_TEXT)
-    except Exception:
-        return False
-    return True
-
-
-async def announce_all(context: ContextTypes.DEFAULT_TYPE):
-    sent, failed = 0, []
-    for chat_id in known_chats():
-        if await announce_version(context, chat_id):
-            sent += 1
-        else:
-            failed.append(chat_id)
-    print(f"Обновление v{BOT_VERSION}: отправлено в {sent} чатов, ошибок: {failed}")
-    logging.info("update announce: sent=%s failed=%s", sent, failed)
-
-
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная рассылка обновления по всем чатам (без перезапуска)."""
+    """Рассылка текста по всем чатам: /broadcast Текст сообщения"""
     msg = update.effective_message
     user = update.effective_user
     if user.id != ADMIN_ID:
         await msg.reply_text("Команда только для владельца бота.")
         return
-    await announce_all(context)
-    await msg.reply_text(f"Отправлено в {len(known_chats())} чатов.")
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply_text("Использование: /broadcast Текст сообщения")
+        return
+    body = parts[1]
+    sent, failed = 0, 0
+    for chat_id in known_chats():
+        try:
+            await context.bot.send_message(chat_id, body)
+            sent += 1
+        except Exception:
+            failed += 1
+    await msg.reply_text(f"Отправлено в {sent} чатов. Ошибок: {failed}")
 
 
 async def addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавить чат в список для рассылки: /addchat -1001234567890"""
+    """Добавить чат в список: /addchat -1001234567890"""
     msg = update.effective_message
     user = update.effective_user
     if user.id != ADMIN_ID:
@@ -1058,8 +1040,7 @@ async def addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_config[cid]
     tracked_groups.add(cid)
     save_settings()
-    await announce_version(context, cid)
-    await msg.reply_text(f"Чат {cid} добавлен, обновление отправлено.")
+    await msg.reply_text(f"Чат {cid} добавлен.")
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1071,7 +1052,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chat.id not in chat_config:
                 chat_config[chat.id]
                 save_settings()
-            await announce_version(context, chat.id)
         else:
             tracked_groups.discard(chat.id)
 
@@ -1177,7 +1157,6 @@ def main():
         app.job_queue.run_repeating(
             lambda _: asyncio.to_thread(_refresh_blocklist), interval=1800, first=2
         )
-        app.job_queue.run_once(announce_all, when=8)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling(
