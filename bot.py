@@ -45,6 +45,8 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 MUTE_MINUTES = 180  # 3 часа
 
+BOT_VERSION = "v1.5"
+
 ALBUM_PHOTO_LIMIT = 7  # максимум фото в одном альбоме (media_group)
 
 # Оценка "возраста" аккаунта по номеру id (Telegram не отдаёт дату создания).
@@ -203,7 +205,7 @@ async def check_url(url: str):
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True, "link_mode": "off"}
+    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True, "link_mode": "off", "ver_notified": ""}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -255,6 +257,7 @@ def load_settings():
                 cfg["pranks"] = bool(value.get("pranks", True))
                 cfg["bot_check"] = bool(value.get("bot_check", True))
                 cfg["link_mode"] = value.get("link_mode", "off") if value.get("link_mode") in LINK_MODES else "off"
+                cfg["ver_notified"] = str(value.get("ver_notified", ""))
                 chat_config[cid] = cfg
         tracked_groups.update(chat_config.keys())
     except Exception:
@@ -992,12 +995,42 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Готово")
 
 
+async def announce_version(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Одноразовое сообщение в чат: «бот обновился до v1.5, добавлена проверка ссылок»."""
+    cfg = chat_config[chat_id]
+    if cfg.get("ver_notified") == BOT_VERSION:
+        return False
+    try:
+        await context.bot.send_message(
+            chat_id,
+            f"🛡 Бот обновлён до {BOT_VERSION}!\n"
+            f"Добавлена проверка ссылок: бот ищет вредоносные ссылки по свежим спискам "
+            f"URLhaus / phishing.army / OpenPhish.\n"
+            f"Включить: /settings → 🔗 Проверка ссылок → "
+            f"«Мутить за опасные ссылки» или «Мутить за все ссылки».",
+        )
+    except Exception:
+        return False
+    cfg["ver_notified"] = BOT_VERSION
+    save_settings()
+    return True
+
+
+async def announce_all(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id in list(chat_config.keys()):
+        try:
+            await announce_version(context, chat_id)
+        except Exception:
+            continue
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     status = update.my_chat_member.new_chat_member.status
     if is_group(chat):
         if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
             tracked_groups.add(chat.id)
+            await announce_version(context, chat.id)
         else:
             tracked_groups.discard(chat.id)
 
@@ -1101,6 +1134,7 @@ def main():
         app.job_queue.run_repeating(
             lambda _: asyncio.to_thread(_refresh_blocklist), interval=1800, first=2
         )
+        app.job_queue.run_repeating(announce_all, interval=3600, first=8)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling(
