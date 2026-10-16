@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -6,6 +7,8 @@ import re
 import socket
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
@@ -95,9 +98,112 @@ MAT_PHRASES = (
     "ой всё, неси ведро и мой рот 😏",
 )
 
+# --- Проверка ссылок -------------------------------------------------------
+URL_RE = re.compile(r"https?://[^\s<>\"'\)\]}]+", re.IGNORECASE)
+
+LINK_MODES = {
+    "off": "выключена",
+    "all": "мутить за любые ссылки",
+    "danger": "мутить за опасные ссылки",
+}
+
+# Бесплатные открытые списки вредоносных ссылок (без ключей, обновляются сами).
+# Хранится и полный URL, и домен — тогда ловим и конкретную ссылку, и фишинг-домен.
+BLOCKLIST_SOURCES = (
+    "https://urlhaus.abuse.ch/downloads/text/",
+    "https://phishing.army/download/phishing_army_blocklist.txt",
+    "https://openphish.com/feed.txt",
+)
+_BLOCK_URLS = set()
+_BLOCK_HOSTS = set()
+_BLOCK_TS = 0.0
+_BLOCK_TTL = 1800.0
+_VIRUS_CACHE = {}
+_VIRUS_TTL = 3600.0      # успешный/чистый ответ кэшируем на час
+_VIRUS_ERR_TTL = 30.0   # ошибка сети — переспрашиваем побыстрее
+BLOCK_HOST_MAX_URLS = 10  # сколько записей в списках допустимо для "вредоносного домена"
+
+
+def _fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 zgs-group-guard"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except Exception:
+        import ssl
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
+            return resp.read().decode("utf-8", "replace")
+
+
+def _refresh_blocklist():
+    global _BLOCK_URLS, _BLOCK_HOSTS, _BLOCK_TS
+    urls = set()
+    per_host = {}
+    for src in BLOCKLIST_SOURCES:
+        try:
+            text = _fetch_text(src)
+        except Exception:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            full = line if line.lower().startswith("http") else "http://" + line
+            full = full.rstrip("/")
+            urls.add(full.lower())
+            try:
+                host = (urllib.parse.urlsplit(full).hostname or "").lower()
+            except Exception:
+                host = ""
+            if host:
+                per_host[host] = per_host.get(host, 0) + 1
+    # Домен считаем опасным, только если в списках он встречается редко: у крупных
+    # сайтов (github, vk) в списках лежат отдельные страницы, а сам домен не вредоносный.
+    hosts = {h for h, n in per_host.items() if n <= BLOCK_HOST_MAX_URLS}
+    if urls:
+        _BLOCK_URLS = urls
+        _BLOCK_HOSTS = hosts
+        _BLOCK_TS = time.time()
+        print(f"Список опасных ссылок обновлён: {len(urls)} url, {len(hosts)} доменов")
+
+
+def _ensure_blocklist():
+    if _BLOCK_URLS and time.time() - _BLOCK_TS < _BLOCK_TTL:
+        return True
+    try:
+        _refresh_blocklist()
+    except Exception:
+        pass
+    return bool(_BLOCK_URLS)
+
+
+def _query_urlhaus(url: str):
+    """True — ссылка в списках вредоносных, False — чистая, None — не смогли проверить."""
+    key = url.strip().rstrip("/.").lower()
+    cached = _VIRUS_CACHE.get(key)
+    if cached and time.time() - cached[0] < cached[1]:
+        return cached[2]
+    if not _ensure_blocklist():
+        _VIRUS_CACHE[key] = (time.time(), _VIRUS_ERR_TTL, None)
+        return None
+    low = key
+    host = ""
+    try:
+        host = (urllib.parse.urlsplit(low).hostname or "").lower()
+    except Exception:
+        host = ""
+    verdict = low in _BLOCK_URLS or (host and host in _BLOCK_HOSTS)
+    _VIRUS_CACHE[key] = (time.time(), _VIRUS_TTL, verdict)
+    return verdict
+
+
+async def check_url(url: str):
+    return await asyncio.to_thread(_query_urlhaus, url)
+
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True}
+    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True, "link_mode": "off"}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -148,6 +254,7 @@ def load_settings():
                 cfg["skip_join"] = [int(u) for u in value.get("skip_join", [])]
                 cfg["pranks"] = bool(value.get("pranks", True))
                 cfg["bot_check"] = bool(value.get("bot_check", True))
+                cfg["link_mode"] = value.get("link_mode", "off") if value.get("link_mode") in LINK_MODES else "off"
                 chat_config[cid] = cfg
         tracked_groups.update(chat_config.keys())
     except Exception:
@@ -203,14 +310,16 @@ def level_desc(level: str) -> str:
     )
 
 
-def settings_text(level: str) -> str:
-    return "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
+def settings_text(level: str, chat_id: int | None = None) -> str:
+    text = "Жёсткость защиты:\n\n" + "\n".join(level_desc(l) for l in LEVELS) + \
         f"\nТекущая: {level}"
+    if chat_id is not None:
+        text += f"\n\nПроверка ссылок: {LINK_MODES.get(chat_config[chat_id]['link_mode'], 'выключена')}"
+    return text
 
 
 def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
-    pranks = chat_config[chat_id]["pranks"]
-    bot_check = chat_config[chat_id]["bot_check"]
+    link_mode = chat_config[chat_id]["link_mode"]
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"Низкая {'✓' if level == 'низкая' else ''}",
@@ -226,15 +335,26 @@ def settings_markup(chat_id: int, level: str) -> InlineKeyboardMarkup:
         ),
     ], [
         InlineKeyboardButton(
-            f"Приколюхи: {'✓ вкл' if pranks else 'выкл'}",
-            callback_data="pranks",
-        ),
-    ], [
-        InlineKeyboardButton(
-            f"Проверка прав ботов: {'✓ вкл' if bot_check else 'выкл'}",
-            callback_data="bot_check",
+            f"🔗 Проверка ссылок: {LINK_MODES.get(link_mode, 'выключена')}",
+            callback_data="link_menu",
         ),
     ]])
+
+
+def link_menu_markup(chat_id: int) -> InlineKeyboardMarkup:
+    link_mode = chat_config[chat_id]["link_mode"]
+    mark = "✓ " if link_mode == "all" else ""
+    mark_d = "✓ " if link_mode == "danger" else ""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"{mark}Мутить за все ссылки", callback_data="link_mode:all"),
+            InlineKeyboardButton(f"{mark_d}Мутить за опасные ссылки", callback_data="link_mode:danger"),
+        ],
+        [
+            InlineKeyboardButton("Выключить проверку", callback_data="link_mode:off"),
+            InlineKeyboardButton("⬅️ Назад к настройкам", callback_data="settings_back"),
+        ],
+    ])
 
 
 def is_group(chat) -> bool:
@@ -304,6 +424,62 @@ async def mute_user(update: Update, user, reason: str, minutes: int = MUTE_MINUT
         pass
     for mid in delete_ids:
         await delete_message(chat, mid)
+    return True
+
+
+async def punish_link(update: Update, user, url: str | None, reason: str) -> None:
+    """Мут навсегда (до ручного размута) с предупреждением и удалением сообщения."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    mention = make_mention(user)
+    text = (
+        f"⚠️ ВНИМАНИЕ! Обнаружена опасная ссылка от пользователя {mention}!\n"
+        + (f"Ссылка: {url}\n" if url else "")
+        + f"Причина: {reason}.\n"
+        f"Сообщение удалено, пользователь замучен навсегда до ручного размута."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Размутить", callback_data=f"unmute:{user.id}")]]
+    )
+    try:
+        await msg.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+    try:
+        await chat.restrict_member(user.id, permissions=MUTE_PERMS, until_date=None)
+    except Exception:
+        pass
+    await delete_message(chat, msg.message_id)
+    clear_tracks(chat.id, user.id)
+
+
+async def handle_links(update: Update, user, urls: list, mode: str) -> bool:
+    """True — сообщение обработано (пользователь наказан или отвечено)."""
+    msg = update.effective_message
+    if mode == "all":
+        await punish_link(update, user, urls[0], "любые ссылки запрещены в этом чате")
+        return True
+
+    checked = False
+    for url in urls[:3]:
+        verdict = await check_url(url)
+        if verdict is True:
+            await punish_link(update, user, url, f"ссылка в базе вредоносных ({url})")
+            return True
+        if verdict is None:
+            continue
+        checked = True
+    try:
+        await msg.reply_text(
+            (f"✅ Ссылка безопасна: {urls[0]}" if checked
+             else "⚠️ Не удалось проверить ссылку, она пропущена."),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -436,6 +612,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     txt = msg.text or msg.caption or ""
     if txt:
+        link_mode = chat_config[chat.id]["link_mode"]
+        if link_mode != "off":
+            urls = URL_RE.findall(txt)
+            if urls and await handle_links(update, user, urls, link_mode):
+                return
+
         link_count = txt.count("http://") + txt.count("https://") + txt.count("t.me/")
 
         # Фильтр "самоботов": нет юзернейма + аккаунт совсем свежий + сразу льёт ссылку.
@@ -586,7 +768,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     level = get_level(chat.id)
-    await msg.reply_text(settings_text(level), reply_markup=settings_markup(chat.id, level))
+    await msg.reply_text(settings_text(level, chat.id), reply_markup=settings_markup(chat.id, level))
 
 
 async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,7 +785,7 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.edit_text(
-            settings_text(level),
+            settings_text(level, chat.id),
             reply_markup=settings_markup(chat.id, level),
         )
     except Exception:
@@ -611,50 +793,67 @@ async def harshness_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"Уровень: {level}")
 
 
-async def pranks_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def link_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat = query.message.chat
     member = await chat.get_member(query.from_user.id)
     if member.status not in ADMIN_STATUSES:
-        await query.answer()
+        await query.answer("Только администраторы могут менять настройки!", show_alert=True)
         return
-
-    chat_config[chat.id]["pranks"] = not chat_config[chat.id]["pranks"]
-    save_settings()
 
     try:
         await query.message.edit_text(
-            settings_text(get_level(chat.id)),
-            reply_markup=settings_markup(chat.id, get_level(chat.id)),
+            "Выберите режим проверки ссылок:",
+            reply_markup=link_menu_markup(chat.id),
         )
     except Exception:
         pass
-    await query.answer(
-        f"Приколюхи: {'включены' if chat_config[chat.id]['pranks'] else 'выключены'}"
-    )
+    await query.answer()
 
 
-async def bot_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def link_mode_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat = query.message.chat
     member = await chat.get_member(query.from_user.id)
     if member.status not in ADMIN_STATUSES:
-        await query.answer()
+        await query.answer("Только администраторы могут менять настройки!", show_alert=True)
         return
 
-    chat_config[chat.id]["bot_check"] = not chat_config[chat.id]["bot_check"]
+    mode = query.data.split(":", 1)[1]
+    if mode not in LINK_MODES:
+        await query.answer()
+        return
+    chat_config[chat.id]["link_mode"] = mode
     save_settings()
 
+    level = get_level(chat.id)
     try:
         await query.message.edit_text(
-            settings_text(get_level(chat.id)),
-            reply_markup=settings_markup(chat.id, get_level(chat.id)),
+            settings_text(level, chat.id),
+            reply_markup=settings_markup(chat.id, level),
         )
     except Exception:
         pass
-    await query.answer(
-        f"Проверка прав ботов: {'включена' if chat_config[chat.id]['bot_check'] else 'выключена'}"
-    )
+    await query.answer(f"Проверка ссылок: {LINK_MODES[mode]}")
+
+
+async def settings_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = query.message.chat
+    member = await chat.get_member(query.from_user.id)
+    if member.status not in ADMIN_STATUSES:
+        await query.answer("Только администраторы могут менять настройки!", show_alert=True)
+        return
+
+    level = get_level(chat.id)
+    try:
+        await query.message.edit_text(
+            settings_text(level, chat.id),
+            reply_markup=settings_markup(chat.id, level),
+        )
+    except Exception:
+        pass
+    await query.answer()
 
 
 async def account_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,7 +872,7 @@ async def account_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.edit_text(
-            settings_text(get_level(chat.id)),
+            settings_text(get_level(chat.id), chat.id),
             reply_markup=settings_markup(chat.id, get_level(chat.id)),
         )
     except Exception:
@@ -859,8 +1058,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- спам ссылками и массовыми упоминаниями\n"
         "- мат\n"
         "- флуд медиа и спам пересылками\n\n"
+        "Также умею проверять ссылки антивирусом (URLhaus) и мьютить "
+        "за опасные или за любые ссылки.\n\n"
         "Команды для администраторов:\n"
-        "/settings - настройки (жёсткость, приколюхи, проверка прав ботов)\n"
+        "/settings - настройки (жёсткость, проверка ссылок)\n"
         "/mute <@ник|id|ссылка> [минуты] [причина] - ручной мут (или ответом)\n"
         "/unmute <@ник|id|ссылка> - размут (или ответом)\n\n"
         "Добавьте меня в группу администратором, и я начну работать."
@@ -890,12 +1091,16 @@ def main():
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(unmute_cb, pattern=r"^unmute:\d+$"))
     app.add_handler(CallbackQueryHandler(harshness_cb, pattern=r"^harshness:"))
-    app.add_handler(CallbackQueryHandler(pranks_cb, pattern=r"^pranks$"))
-    app.add_handler(CallbackQueryHandler(bot_check_cb, pattern=r"^bot_check$"))
+    app.add_handler(CallbackQueryHandler(link_menu_cb, pattern=r"^link_menu$"))
+    app.add_handler(CallbackQueryHandler(link_mode_cb, pattern=r"^link_mode:"))
+    app.add_handler(CallbackQueryHandler(settings_back_cb, pattern=r"^settings_back$"))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
     if app.job_queue:
         app.job_queue.run_repeating(enforce_bot_rights, interval=30, first=10)
+        app.job_queue.run_repeating(
+            lambda _: asyncio.to_thread(_refresh_blocklist), interval=1800, first=2
+        )
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling(
