@@ -205,7 +205,7 @@ async def check_url(url: str):
 
 
 def _new_chat_config():
-    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True, "link_mode": "off", "ver_notified": ""}
+    return {"level": DEFAULT_LEVEL, "account_check": False, "max_user_id": 0, "skip_join": [], "pranks": True, "bot_check": True, "link_mode": "off"}
 
 
 chat_config = defaultdict(_new_chat_config)
@@ -257,7 +257,6 @@ def load_settings():
                 cfg["pranks"] = bool(value.get("pranks", True))
                 cfg["bot_check"] = bool(value.get("bot_check", True))
                 cfg["link_mode"] = value.get("link_mode", "off") if value.get("link_mode") in LINK_MODES else "off"
-                cfg["ver_notified"] = str(value.get("ver_notified", ""))
                 chat_config[cid] = cfg
         tracked_groups.update(chat_config.keys())
     except Exception:
@@ -996,10 +995,7 @@ async def ban_raider_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def announce_version(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
-    """Одноразовое сообщение в чат: «бот обновился до v1.5, добавлена проверка ссылок»."""
-    cfg = chat_config[chat_id]
-    if cfg.get("ver_notified") == BOT_VERSION:
-        return False
+    """Сообщение в чат при каждом запуске/перезапуске бота: что обновлено."""
     try:
         await context.bot.send_message(
             chat_id,
@@ -1011,8 +1007,6 @@ async def announce_version(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> 
         )
     except Exception:
         return False
-    cfg["ver_notified"] = BOT_VERSION
-    save_settings()
     return True
 
 
@@ -1134,7 +1128,7 @@ def main():
         app.job_queue.run_repeating(
             lambda _: asyncio.to_thread(_refresh_blocklist), interval=1800, first=2
         )
-        app.job_queue.run_repeating(announce_all, interval=3600, first=8)
+        app.job_queue.run_once(announce_all, when=8)
     logging.info("Бот запущен. Нажмите Ctrl+C для остановки.")
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling(
