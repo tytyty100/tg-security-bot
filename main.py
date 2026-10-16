@@ -54,19 +54,23 @@ def serve_forever():
     ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
+SERVICE_URL = "https://tg-security-bot.onrender.com"
+
+
 def keepalive_forever():
     # Render free засыпает после 15 мин без входящего трафика. Самообращение по
     # внешнему URL проходит через роутер Render и держит сервис активным.
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url:
-        return
-    url = url.rstrip("/") + "/health"
+    # Render больше не подставляет RENDER_EXTERNAL_URL автоматически, поэтому
+    # используем адрес из переменной, иначе запасной (жёстко прописанный).
+    base = os.environ.get("RENDER_EXTERNAL_URL") or SERVICE_URL
+    url = base.rstrip("/") + "/health"
     while True:
-        time.sleep(300)
         try:
-            urllib.request.urlopen(url, timeout=10)
-        except Exception:
-            pass
+            urllib.request.urlopen(f"{url}?t={int(time.time())}", timeout=10)
+            sys.stderr.write("keepalive ok\n")
+        except Exception as exc:
+            sys.stderr.write(f"keepalive failed: {exc!r}\n")
+        time.sleep(240)
 
 
 def run_bot():
