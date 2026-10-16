@@ -47,6 +47,16 @@ MUTE_MINUTES = 180  # 3 часа
 
 BOT_VERSION = "v1.5"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+ADMIN_USER = (os.environ.get("ADMIN_USER", "ME_LOVE_A_CATS") or "").lstrip("@").lower()
+
+
+def is_admin(user) -> bool:
+    """Владелец бота: по числовому ID (ADMIN_ID) или по @нику (ADMIN_USER)."""
+    if user is None:
+        return False
+    if ADMIN_ID and user.id == ADMIN_ID:
+        return True
+    return bool(ADMIN_USER) and (user.username or "").lower() == ADMIN_USER
 
 ALBUM_PHOTO_LIMIT = 7  # максимум фото в одном альбоме (media_group)
 
@@ -1007,7 +1017,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Рассылка текста по всем чатам: /broadcast Текст сообщения"""
     msg = update.effective_message
     user = update.effective_user
-    if user.id != ADMIN_ID:
+    if not is_admin(user):
         await msg.reply_text("Команда только для владельца бота.")
         return
     parts = (msg.text or "").split(maxsplit=1)
@@ -1029,7 +1039,7 @@ async def addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавить чат в список: /addchat -1001234567890"""
     msg = update.effective_message
     user = update.effective_user
-    if user.id != ADMIN_ID:
+    if not is_admin(user):
         await msg.reply_text("Команда только для владельца бота.")
         return
     parts = (msg.text or "").split()
